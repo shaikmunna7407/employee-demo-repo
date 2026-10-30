@@ -1,0 +1,95 @@
+name: Build and Deploy Employee Management Demo
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: employee-management-demo/package-lock.json
+
+      - name: Install dependencies
+        working-directory: employee-management-demo
+        run: npm ci
+
+      - name: Run tests
+        working-directory: employee-management-demo
+        run: npm test
+
+      - name: Build frontend assets
+        working-directory: employee-management-demo
+        env:
+          API_BASE_URL: http://${{ secrets.EC2_HOST }}:3000/api
+        run: npm run build
+
+      - name: Build backend Docker image
+        run: docker build --tag employee-management-demo:latest ./employee-management-demo
+
+      - name: Save backend Docker image
+        run: docker save employee-management-demo:latest | gzip > "$RUNNER_TEMP/employee-management-demo.tar.gz"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Sync frontend assets to S3
+        env:
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+        run: aws s3 sync ./employee-management-demo/dist/ "s3://${S3_BUCKET}/" --delete --only-show-errors
+
+      - name: Prepare SSH connection
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$EC2_SSH_KEY" > "$RUNNER_TEMP/ec2_deploy_key"
+          chmod 600 "$RUNNER_TEMP/ec2_deploy_key"
+          ssh-keyscan -H "$EC2_HOST" >> "$HOME/.ssh/known_hosts"
+
+      - name: Transfer image and Compose configuration
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          set -euo pipefail
+          deploy_dir="/home/${EC2_USER}/employee-management-demo"
+          ssh -i "$RUNNER_TEMP/ec2_deploy_key" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            "${EC2_USER}@${EC2_HOST}" "mkdir -p '${deploy_dir}'"
+          scp -i "$RUNNER_TEMP/ec2_deploy_key" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            "$RUNNER_TEMP/employee-management-demo.tar.gz" \
+            "./employee-management-demo/docker-compose.yml" \
+            "${EC2_USER}@${EC2_HOST}:${deploy_dir}/"
+
+      - name: Load image and restart Compose service
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          set -euo pipefail
+          ssh -i "$RUNNER_TEMP/ec2_deploy_key" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            "${EC2_USER}@${EC2_HOST}" \
+            "cd '/home/${EC2_USER}/employee-management-demo' && gunzip -c employee-management-demo.tar.gz | docker load && docker compose up -d --no-build --remove-orphans && rm -f employee-management-demo.tar.gz"
+
+      - name: Verify backend health
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: curl --fail --silent --show-error --retry 12 --retry-delay 5 --retry-connrefused "http://${EC2_HOST}:3000/api/health"
